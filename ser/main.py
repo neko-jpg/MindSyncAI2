@@ -4,6 +4,8 @@ import hydra
 import random
 import numpy as np
 import pandas as pd
+import torch.nn.functional as F
+import torchaudio.transforms as T
 from tqdm import tqdm
 from omegaconf import DictConfig, OmegaConf
 from torch.optim.swa_utils import AveragedModel
@@ -12,9 +14,8 @@ from sklearn.model_selection import GroupShuffleSplit
 from sklearn.metrics import recall_score, f1_score
 from torch.nn import CrossEntropyLoss
 
-from .data import RavdessDataset
-from .preproc import LogMelSpectrogram
-from .model import CRNNModel
+from data.ravdess_dataset import RavdessDataset
+from .models.mobile_crnn_v1 import MobileCRNNv1
 
 def set_seed(seed):
     """Sets the random seed for reproducibility."""
@@ -26,13 +27,41 @@ def set_seed(seed):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-def train_one_epoch(model, ema_model, data_loader, criterion, optimizer, device):
+def collate_batch(batch):
+    """Pad variable-length spectrograms and stack other fields."""
+    features = [item["features"] for item in batch]
+    labels = torch.stack([item["label"] for item in batch])
+    speaker_ids = torch.tensor([item["speaker_id"] for item in batch], dtype=torch.long)
+
+    lengths = torch.tensor([feat.shape[-1] for feat in features], dtype=torch.long)
+    max_length = int(lengths.max())
+
+    padded = []
+    for feat in features:
+        pad_amount = max_length - feat.shape[-1]
+        if pad_amount > 0:
+            feat = F.pad(feat, (0, pad_amount))
+        padded.append(feat)
+
+    feature_tensor = torch.stack(padded)
+    return {
+        "features": feature_tensor,
+        "label": labels,
+        "speaker_id": speaker_ids,
+        "length": lengths
+    }
+
+
+def train_one_epoch(model, ema_model, data_loader, criterion, optimizer, device, spec_augment=None):
     """Runs a single training epoch and updates the EMA model."""
     model.train()
     total_loss = 0
     pbar = tqdm(data_loader, desc="Training", leave=False)
     for batch in pbar:
-        features = batch['features'].to(device)
+        features = batch['features']
+        if spec_augment is not None:
+            features = spec_augment(features)
+        features = features.to(device)
         labels = batch['label'].to(device)
 
         optimizer.zero_grad()
@@ -84,36 +113,52 @@ def main(cfg: DictConfig) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    data_path = hydra.utils.to_absolute_path(cfg.dataset.path)
+    data_path = hydra.utils.to_absolute_path(cfg.data_dir)
+    sample_rate = OmegaConf.select(cfg, "features.sample_rate", default=16000)
+    n_mels = OmegaConf.select(cfg, "features.n_mels", default=64)
 
-    # Use the new unified preprocessor
-    # Note: The preprocessor itself doesn't need config if it loads the spec file internally
-    feature_extractor = LogMelSpectrogram()
-
-    full_dataset = RavdessDataset(root_dir=data_path, feature_extractor=feature_extractor, cfg=cfg)
+    full_dataset = RavdessDataset(data_dir=data_path, sample_rate=sample_rate, n_mels=n_mels)
 
     speaker_ids = np.array([s['speaker_id'] for s in full_dataset.samples])
     gss = GroupShuffleSplit(n_splits=1, test_size=cfg.evaluation.test_size, random_state=cfg.seed)
     train_indices, val_indices = next(gss.split(full_dataset.samples, groups=speaker_ids))
     train_dataset, val_dataset = Subset(full_dataset, train_indices), Subset(full_dataset, val_indices)
 
-    train_loader = DataLoader(train_dataset, batch_size=cfg.training.batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=cfg.training.batch_size, shuffle=False)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=cfg.training.batch_size,
+        shuffle=True,
+        collate_fn=collate_batch
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=cfg.training.batch_size,
+        shuffle=False,
+        collate_fn=collate_batch
+    )
 
-    model = CRNNModel(cfg).to(device)
+    model = MobileCRNNv1(num_classes=cfg.dataset.num_classes).to(device)
     # Initialize EMA model
     ema_model = AveragedModel(model)
+    ema_model.module.to(device)
 
     criterion = CrossEntropyLoss()
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.training.optimizer.lr)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.training.epochs)
+
+    spec_augment = None
+    if OmegaConf.select(cfg, "training.spec_augment.freq_mask_param", default=None) is not None:
+        spec_augment = torch.nn.Sequential(
+            T.FrequencyMasking(freq_mask_param=cfg.training.spec_augment.freq_mask_param),
+            T.TimeMasking(time_mask_param=cfg.training.spec_augment.time_mask_param),
+        )
 
     log_history = []
     best_uar = 0.0
 
     print("\n--- Starting Training ---")
     for epoch in range(1, cfg.training.epochs + 1):
-        train_loss = train_one_epoch(model, ema_model, train_loader, criterion, optimizer, device)
+        train_loss = train_one_epoch(model, ema_model, train_loader, criterion, optimizer, device, spec_augment)
 
         # Evaluate the base model for most of the training
         val_loss, uar, macro_f1 = evaluate(model, val_loader, criterion, device)
@@ -130,8 +175,10 @@ def main(cfg: DictConfig) -> None:
         # Save the best *base* model during training
         if uar > best_uar:
             best_uar = uar
-            # We save the EMA model's weights, as it's expected to generalize better
-            torch.save(ema_model.module.state_dict(), "best_model.pth")
+            ema_model_path_run = os.path.join(os.getcwd(), "best_model.pth")
+            ema_model_path_project = hydra.utils.to_absolute_path("best_model.pth")
+            torch.save(ema_model.module.state_dict(), ema_model_path_run)
+            torch.save(ema_model.module.state_dict(), ema_model_path_project)
             print(f"  -> New best EMA model saved with UAR: {uar:.4f}")
 
     # --- Final Evaluation of the EMA model ---

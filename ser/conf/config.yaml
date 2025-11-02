@@ -9,6 +9,11 @@ data_dir: data
 experiments_dir: experiments
 models_dir: models
 
+# Feature extraction
+features:
+  sample_rate: 16000
+  n_mels: 64
+
 # --- Placeholders for future configurations ---
 
 # Dataset configuration

@@ -46,35 +46,81 @@ pip install -r requirements.txt
 ```
 
 ### c. Prepare Datasets
-1. Download the [RAVDESS](https://zenodo.org/record/1188976) and/or [CREMA-D](https://github.com/CheyneyComputerScience/CREMA-D) datasets.
-2. Place the datasets in a `data/` directory at the project's root. The expected structure is:
-   ```
-   .
-   ├── data/
-   │   ├── RAVDESS/
-   │   │   ├── Actor_01/
-   │   │   └── ...
-   │   └── CREMA-D/
-   │       ├── 1001_DFA_ANG_XX.wav
-   │       └── ...
-   └── ...
-   ```
+Bootstrap the multi-corpus pack (RAVDESS, CREMA-D, TESS, SAVEE, Emo-DB) from Hugging Face mirrors:
+```bash
+python scripts/dataset_setup.py --root data
+```
+
+This yields:
+```text
+.
+data/
+|- RAVDESS/
+|- CREMA-D/
+|- TESS/
+|- SAVEE/
+- EMO-DB/
+```
+
+Prefer manual downloads? Place the corpora under the same layout and the loaders will discover them automatically.
+
 
 ## 2. Training the Model
 
-The training process is managed by [Hydra](https://hydra.cc/). You can customize the training parameters by editing the configuration file at `ser/conf/config.yaml` or by overriding them from the command line.
+The training process is managed by Hydra. Use either the baseline configuration (ser/conf/config.yaml) or the Phase 2 upgrade (ser/conf/config_phase2.yaml).
 
-To start training, run the main script from the project root:
+### a. Baseline quick start
 ```bash
 python -m ser.main
 ```
-
-To override parameters, use the following syntax:
+Override parameters with standard Hydra overrides:
 ```bash
 python -m ser.main training.epochs=50 dataset.name=ravdess
 ```
 
-The training script will save the best model (based on Unweighted Average Recall - UAR) to `best_model.pth` and log the training progress to `training_log.csv`.
+### b. Phase 2 orchestrator
+```bash
+python phase2_train.py --config-name config_phase2 --keepalive-seconds 300 --log-file outputs/phase2_train.log
+```
+Add -o KEY=VALUE for Hydra overrides (for example -o training.epochs=160).
+
+**RTX 3080 8GB preset**  
+Use `--config-name config_phase2_rtx3080` to load the memory-optimized preset (micro-batch 8 with 4-step gradient accumulation). Example:
+```bash
+python phase2_train.py --config-name config_phase2_rtx3080 -o model.use_mixstyle=true -o model.use_conformer=true
+```
+
+If a run stops mid-way, resume from the latest checkpoints with:
+```bash
+python phase2_train.py --config-name config_phase2 --resume-from checkpoints
+```
+The --resume-from flag accepts either a checkpoint file (latest_state.pth) or a directory containing per-fold subdirectories.
+
+Every run stores the best-scoring model (by UAR) as best_model.pth and writes epoch metrics to training_log.csv.
+
+### c. Self-training with pseudo labels
+1. Generate confident predictions on unlabeled audio:
+   ```bash
+   python scripts/generate_pseudo_labels.py \
+     --config-name config_phase2 \
+     --checkpoint checkpoints/fold_0/best_model.pth \
+     --unlabeled-root /path/to/unlabeled_audio \
+     --output-csv data/pseudo/pseudo_labels.csv \
+     --copy-audio data/pseudo/audio \
+     --min-confidence 0.9
+   ```
+   The script mirrors accepted clips (optional) and emits `pseudo_labels.csv` plus a `.meta` summary.
+2. Append the pseudo dataset when launching training:
+   ```bash
+   python phase2_train.py \
+     --config-name config_phase2 \
+     -o dataset.names='[ravdess,cremad,tess,savee,emodb,pseudo]' \
+     -o dataset.sources.pseudo.type=metadata \
+     -o dataset.sources.pseudo.metadata_path=data/pseudo/pseudo_labels.csv \
+     -o dataset.sources.pseudo.audio_root=data/pseudo/audio
+   ```
+   Additional overrides (e.g. lower `min_confidence`, adjusted loss weights) can be stacked as needed.
+   Tip: enable balanced multi-corpus sampling via `-o dataset.sampling.strategy=balanced` or set per-source weights with `-o dataset.sources.NAME.weight=1.5`.
 
 ## 3. Exporting the Model for Mobile
 

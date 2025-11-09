@@ -4,15 +4,16 @@ import torch
 import torch.nn as nn
 
 try:
-    from transformers import AutoConfig, AutoModel
-except ImportError as exc:  # pragma: no cover - handled at runtime
-    raise ImportError("transformers ライブラリが必要です。`pip install transformers` を実行してください。") from exc
+    from transformers import Wav2Vec2Model, Wav2Vec2Config
+except ImportError as exc:
+    raise ImportError(
+        "transformers ライブラリが見つかりません。`pip install transformers` を実行してください。"
+    ) from exc
 
 
 class Wav2Vec2SERNet(nn.Module):
     """
-    Wav2Vec2 などの事前学習音声モデルを取り込み、自己注意 + MLP ヘッドで分類するモデル。
-    """
+    Wav2Vec2 などの事前学習音声モチEを取り込み、E己注愁E+ MLP ヘッドで刁EするモチE、E    """
 
     def __init__(self, cfg):
         super().__init__()
@@ -81,7 +82,7 @@ class Wav2Vec2SERNet(nn.Module):
         **kwargs,
     ) -> torch.Tensor:
         if waveforms is None:
-            raise ValueError("Wav2Vec2SERNet では waveforms テンソルが必須です。")
+            raise ValueError("Wav2Vec2SERNet では waveforms チEソルが忁Eです、E)
 
         if waveform_lengths is not None:
             max_len = waveforms.size(1)
@@ -103,5 +104,7 @@ class Wav2Vec2SERNet(nn.Module):
         mean_pool = hidden_states.mean(dim=1)
         max_pool, _ = hidden_states.max(dim=1)
         pooled = torch.cat([mean_pool, max_pool], dim=-1)
+        self.latest_embedding = pooled
         logits = self.head(pooled)
+        self.latest_logits = logits
         return logits
